@@ -6,13 +6,21 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	tfjson "github.com/hashicorp/terraform-json"
+	"gorm.io/gorm"
 )
+
+// ---------------------------------------------------------------------------
+// State version queries
+// ---------------------------------------------------------------------------
 
 func latestUploadedState(workspaceID string) (StateVersion, bool) {
 	var sv StateVersion
-	if err := db.Where("workspace_id = ? AND upload_complete = ?", workspaceID, true).Order("created_at desc, serial desc").First(&sv).Error; err != nil {
+	if err := db.Where("workspace_id = ? AND upload_complete = ?", workspaceID, true).
+		Order("created_at desc, serial desc").
+		First(&sv).Error; err != nil {
 		return StateVersion{}, false
 	}
 	return sv, true
@@ -20,11 +28,74 @@ func latestUploadedState(workspaceID string) (StateVersion, bool) {
 
 func loadUploadedStateVersion(workspaceID string, stateVersionID string) (StateVersion, bool) {
 	var sv StateVersion
-	if err := db.Where("workspace_id = ? AND id = ? AND upload_complete = ?", workspaceID, stateVersionID, true).First(&sv).Error; err != nil {
+	if err := db.Where("workspace_id = ? AND id = ? AND upload_complete = ?", workspaceID, stateVersionID, true).
+		First(&sv).Error; err != nil {
 		return StateVersion{}, false
 	}
 	return sv, true
 }
+
+// nextSerial returns the next serial number for a workspace, falling back to 1.
+func nextSerial(workspaceID string) int {
+	var latest StateVersion
+	if err := db.Where("workspace_id = ?", workspaceID).
+		Order("serial desc").
+		First(&latest).Error; err == nil {
+		return latest.Serial + 1
+	}
+	return 1
+}
+
+// resolveLineage returns the lineage to use for a new state version.
+// Priority: explicitly parsed from raw state → inherited from latest version → newly generated.
+func resolveLineage(workspaceID, parsed string) string {
+	if parsed != "" {
+		return parsed
+	}
+	if latest, found := latestUploadedState(workspaceID); found && latest.Lineage != "" {
+		return latest.Lineage
+	}
+	return fmt.Sprintf("lineage-%s", newID(""))
+}
+
+// upsertProviders replaces provider selections for the given state version.
+// Existing selections for the same source are deleted before inserting new
+// ones, so calling sync-state multiple times is idempotent.
+func upsertProviders(tx *gorm.DB, stateVersionID string, providers []providerVersionInput) error {
+	sources := make([]string, 0, len(providers))
+	for _, p := range providers {
+		if p.Source != "" {
+			sources = append(sources, p.Source)
+		}
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	if err := tx.Where("state_version_id = ? AND source IN ?", stateVersionID, sources).
+		Delete(&ProviderSelection{}).Error; err != nil {
+		return err
+	}
+	for _, provider := range providers {
+		if provider.Source == "" {
+			continue
+		}
+		selection := ProviderSelection{
+			ID:             newID("ps"),
+			StateVersionID: stateVersionID,
+			Source:         provider.Source,
+			Version:        provider.Version,
+			CreatedAt:      time.Now(),
+		}
+		if err := tx.Create(&selection).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Run response helpers
+// ---------------------------------------------------------------------------
 
 func cliRunResponse(run CLIRun, includeLogs bool) map[string]interface{} {
 	data := map[string]interface{}{
@@ -44,15 +115,24 @@ func cliRunResponse(run CLIRun, includeLogs bool) map[string]interface{} {
 	return data
 }
 
+// normalizeRunStatus returns the canonical form of a run status string, or
+// the empty string when the value is not recognised.
 func normalizeRunStatus(status string) string {
-	value := strings.TrimSpace(strings.ToLower(status))
-	switch value {
-	case "planned", "applied", "error":
-		return value
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case RunStatusPlanned:
+		return RunStatusPlanned
+	case RunStatusApplied:
+		return RunStatusApplied
+	case RunStatusError:
+		return RunStatusError
 	default:
 		return ""
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Provider helpers
+// ---------------------------------------------------------------------------
 
 func providerVersionMapForState(stateVersionID string) map[string]string {
 	result := map[string]string{}
@@ -79,15 +159,24 @@ func applyProviderVersions(resources []resourceNode, providerVersions map[string
 	return resources
 }
 
+// ---------------------------------------------------------------------------
+// Raw state parsing
+// ---------------------------------------------------------------------------
+
 func parseRawStateMetadata(rawState []byte) (string, int, string) {
 	var parsed struct {
 		TerraformVersion string `json:"terraform_version"`
 		Serial           int    `json:"serial"`
 		Lineage          string `json:"lineage"`
 	}
+	// Errors are non-fatal; callers handle missing fields as zero values.
 	_ = json.Unmarshal(rawState, &parsed)
 	return parsed.TerraformVersion, parsed.Serial, parsed.Lineage
 }
+
+// ---------------------------------------------------------------------------
+// Resource extraction and diff helpers
+// ---------------------------------------------------------------------------
 
 func digestResources(sv StateVersion) map[string]resourceDigest {
 	resources := extractResources(sv.RawState)
@@ -225,7 +314,6 @@ func walkModule(module *tfjson.StateModule, out *[]resourceNode, modulePath stri
 	if module == nil {
 		return
 	}
-
 	if modulePath == "" {
 		modulePath = "root"
 	}
@@ -320,15 +408,19 @@ func normalizeProviderSource(provider string) string {
 	return provider
 }
 
+// ---------------------------------------------------------------------------
+// State summary
+// ---------------------------------------------------------------------------
+
 func summarizeState(sv StateVersion) stateSummary {
-	type rawState struct {
+	type rawStateShape struct {
 		TerraformVersion string                 `json:"terraform_version"`
 		Serial           int                    `json:"serial"`
 		Lineage          string                 `json:"lineage"`
 		Outputs          map[string]interface{} `json:"outputs"`
 	}
 
-	var parsed rawState
+	var parsed rawStateShape
 	_ = json.Unmarshal(sv.RawState, &parsed)
 
 	providerVersions := providerVersionMapForState(sv.ID)
@@ -389,3 +481,4 @@ func summarizeState(sv StateVersion) stateSummary {
 		},
 	}
 }
+

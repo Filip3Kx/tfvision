@@ -9,100 +9,78 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"gorm.io/gorm"
 )
 
 func handleGetCurrentStateVersion(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 	sv, found := latestUploadedState(workspaceID)
 	if !found {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/vnd.api+json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data": map[string]interface{}{
-			"id":   sv.ID,
-			"type": "state-versions",
-			"attributes": map[string]interface{}{
-				"serial":                    sv.Serial,
-				"lineage":                   sv.Lineage,
-				"created-at":                sv.CreatedAt.Format(time.RFC3339),
-				"hosted-state-download-url": fmt.Sprintf("https://%s/internal/state/%s", r.Host, sv.ID),
-			},
-		},
+	writeJSONAPI(w, http.StatusOK, map[string]interface{}{
+		"data": stateVersionResource(sv, r.Host),
 	})
 }
 
 func handleListStateVersions(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 	var svs []StateVersion
-	db.Where("workspace_id = ? AND upload_complete = ?", workspaceID, true).Order("created_at desc, serial desc").Find(&svs)
+	if err := db.Where("workspace_id = ? AND upload_complete = ?", workspaceID, true).
+		Order("created_at desc, serial desc").
+		Find(&svs).Error; err != nil {
+		writeInternalError(w)
+		return
+	}
 
 	data := make([]interface{}, 0, len(svs))
 	for _, sv := range svs {
-		data = append(data, map[string]interface{}{
-			"id":   sv.ID,
-			"type": "state-versions",
-			"attributes": map[string]interface{}{
-				"serial":                    sv.Serial,
-				"lineage":                   sv.Lineage,
-				"created-at":                sv.CreatedAt.Format(time.RFC3339),
-				"hosted-state-download-url": fmt.Sprintf("https://%s/internal/state/%s", r.Host, sv.ID),
-			},
-		})
+		data = append(data, stateVersionResource(sv, r.Host))
 	}
-
-	w.Header().Set("Content-Type", "application/vnd.api+json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": data})
+	writeJSONAPI(w, http.StatusOK, map[string]interface{}{"data": data})
 }
 
 func handleCreateStateVersion(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 
 	var payload stateVersionCreatePayload
-	_ = json.NewDecoder(r.Body).Decode(&payload)
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeBadRequest(w, fmt.Sprintf("invalid request body: %s", err.Error()))
+		return
+	}
 
 	serial := payload.Data.Attributes.Serial
 	if serial == 0 {
-		var latest StateVersion
-		if err := db.Where("workspace_id = ?", workspaceID).Order("serial desc").First(&latest).Error; err == nil {
-			serial = latest.Serial + 1
-		} else {
-			serial = 1
-		}
+		serial = nextSerial(workspaceID)
 	}
 
 	lineage := payload.Data.Attributes.Lineage
 	if lineage == "" {
-		latest, found := latestUploadedState(workspaceID)
-		if found && latest.Lineage != "" {
-			lineage = latest.Lineage
-		} else {
-			lineage = fmt.Sprintf("lineage-%d", time.Now().UnixNano())
-		}
+		lineage = resolveLineage(workspaceID, "")
 	}
 
 	sv := StateVersion{
-		ID:             "sv-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:             newID("sv"),
 		WorkspaceID:    workspaceID,
 		Serial:         serial,
 		Lineage:        lineage,
 		UploadComplete: false,
 		CreatedAt:      time.Now(),
 	}
-	db.Create(&sv)
+	if err := db.Create(&sv).Error; err != nil {
+		writeInternalError(w)
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/vnd.api+json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSONAPI(w, http.StatusCreated, map[string]interface{}{
 		"data": map[string]interface{}{
 			"id":   sv.ID,
 			"type": "state-versions",
 			"attributes": map[string]interface{}{
 				"serial":                       sv.Serial,
 				"lineage":                      sv.Lineage,
-				"status":                       "pending",
+				"status":                       StateVersionStatusPending,
 				"hosted-state-upload-url":      fmt.Sprintf("https://%s/internal/state/%s/upload", r.Host, sv.ID),
 				"hosted-state-download-url":    fmt.Sprintf("https://%s/internal/state/%s", r.Host, sv.ID),
 				"hosted-json-state-upload-url": fmt.Sprintf("https://%s/internal/state/%s/upload-json", r.Host, sv.ID),
@@ -115,17 +93,16 @@ func handleGetStateVersion(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	var sv StateVersion
 	if err := db.Where("id = ?", id).First(&sv).Error; err != nil {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
-	status := "pending"
+	status := StateVersionStatusPending
 	if sv.UploadComplete {
-		status = "uploaded"
+		status = StateVersionStatusUploaded
 	}
 
-	w.Header().Set("Content-Type", "application/vnd.api+json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSONAPI(w, http.StatusOK, map[string]interface{}{
 		"data": map[string]interface{}{
 			"id":   sv.ID,
 			"type": "state-versions",
@@ -149,7 +126,7 @@ func handleCompareStateVersions(w http.ResponseWriter, r *http.Request) {
 	fromState, okFrom := loadUploadedStateVersion(workspaceID, fromID)
 	toState, okTo := loadUploadedStateVersion(workspaceID, toID)
 	if !okFrom || !okTo {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
@@ -182,8 +159,7 @@ func handleCompareStateVersions(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(fromState.RawState, &rawBefore)
 	_ = json.Unmarshal(toState.RawState, &rawAfter)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"data": map[string]interface{}{
 			"type": "state-version-diff",
 			"id":   fmt.Sprintf("%s-%s", fromID, toID),
@@ -207,36 +183,35 @@ func handleCompareStateVersions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleStateSync is the tfvision-specific endpoint used by the CLI to
+// synchronise state and/or provider metadata.  Two modes are supported:
+//
+//  1. Full sync: raw_state_base64 is present → persist a new state version and
+//     its provider selections atomically inside a single transaction.
+//  2. Enrich-only: raw_state_base64 is absent → attach provider versions to the
+//     latest existing state version.
 func handleStateSync(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxStateBodyBytes)
 	var payload stateSyncPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeBadRequest(w, "invalid request body")
 		return
 	}
 
 	if payload.RawStateBase64 == "" {
+		// Enrich-only mode: update provider versions on the latest state.
 		sv, found := latestUploadedState(workspaceID)
 		if !found {
-			w.WriteHeader(http.StatusNotFound)
+			writeNotFound(w)
 			return
 		}
-		for _, provider := range payload.Providers {
-			if provider.Source == "" {
-				continue
-			}
-			selection := ProviderSelection{
-				ID:             fmt.Sprintf("ps-%d", time.Now().UnixNano()),
-				StateVersionID: sv.ID,
-				Source:         provider.Source,
-				Version:        provider.Version,
-				CreatedAt:      time.Now(),
-			}
-			db.Create(&selection)
+		if err := upsertProviders(db, sv.ID, payload.Providers); err != nil {
+			writeInternalError(w)
+			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"data": map[string]interface{}{
 				"id":             sv.ID,
 				"workspace_id":   sv.WorkspaceID,
@@ -249,43 +224,32 @@ func handleStateSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Full sync mode: decode the state, resolve serial/lineage, and persist
+	// the state version together with its provider selections in a transaction.
 	rawState, err := base64.StdEncoding.DecodeString(payload.RawStateBase64)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeBadRequest(w, "invalid base64 in raw_state_base64")
 		return
 	}
 
 	_, parsedSerial, parsedLineage := parseRawStateMetadata(rawState)
+
 	serial := payload.Serial
 	if serial == 0 {
 		if parsedSerial > 0 {
 			serial = parsedSerial
 		} else {
-			var latest StateVersion
-			if err := db.Where("workspace_id = ?", workspaceID).Order("serial desc").First(&latest).Error; err == nil {
-				serial = latest.Serial + 1
-			} else {
-				serial = 1
-			}
+			serial = nextSerial(workspaceID)
 		}
 	}
 
 	lineage := payload.Lineage
 	if lineage == "" {
-		if parsedLineage != "" {
-			lineage = parsedLineage
-		} else {
-			latest, found := latestUploadedState(workspaceID)
-			if found && latest.Lineage != "" {
-				lineage = latest.Lineage
-			} else {
-				lineage = fmt.Sprintf("lineage-%d", time.Now().UnixNano())
-			}
-		}
+		lineage = resolveLineage(workspaceID, parsedLineage)
 	}
 
 	sv := StateVersion{
-		ID:             "sv-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:             newID("sv"),
 		WorkspaceID:    workspaceID,
 		Serial:         serial,
 		Lineage:        lineage,
@@ -293,28 +257,18 @@ func handleStateSync(w http.ResponseWriter, r *http.Request) {
 		UploadComplete: true,
 		CreatedAt:      time.Now(),
 	}
-	if err := db.Create(&sv).Error; err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&sv).Error; err != nil {
+			return err
+		}
+		return upsertProviders(tx, sv.ID, payload.Providers)
+	}); err != nil {
+		writeInternalError(w)
 		return
 	}
 
-	for _, provider := range payload.Providers {
-		if provider.Source == "" {
-			continue
-		}
-		selection := ProviderSelection{
-			ID:             fmt.Sprintf("ps-%d", time.Now().UnixNano()),
-			StateVersionID: sv.ID,
-			Source:         provider.Source,
-			Version:        provider.Version,
-			CreatedAt:      time.Now(),
-		}
-		db.Create(&selection)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"data": map[string]interface{}{
 			"id":             sv.ID,
 			"workspace_id":   sv.WorkspaceID,
@@ -324,3 +278,21 @@ func handleStateSync(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Response shape helper
+// ---------------------------------------------------------------------------
+
+func stateVersionResource(sv StateVersion, host string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":   sv.ID,
+		"type": "state-versions",
+		"attributes": map[string]interface{}{
+			"serial":                    sv.Serial,
+			"lineage":                   sv.Lineage,
+			"created-at":                sv.CreatedAt.Format(time.RFC3339),
+			"hosted-state-download-url": fmt.Sprintf("https://%s/internal/state/%s", host, sv.ID),
+		},
+	}
+}
+

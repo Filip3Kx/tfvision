@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -15,8 +14,7 @@ func handleListWorkspaceResources(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 	sv, found := latestUploadedState(workspaceID)
 	if !found {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"data": []interface{}{}})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"data": []interface{}{}})
 		return
 	}
 
@@ -27,22 +25,18 @@ func handleListWorkspaceResources(w http.ResponseWriter, r *http.Request) {
 		return left < right
 	})
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": resources})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": resources})
 }
 
 func handleGetWorkspaceStateSummary(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 	sv, found := latestUploadedState(workspaceID)
 	if !found {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"data": nil})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"data": nil})
 		return
 	}
 
-	summary := summarizeState(sv)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": summary})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": summarizeState(sv)})
 }
 
 func handleGetStateVersionSummary(w http.ResponseWriter, r *http.Request) {
@@ -52,23 +46,21 @@ func handleGetStateVersionSummary(w http.ResponseWriter, r *http.Request) {
 
 	sv, found := loadUploadedStateVersion(workspaceID, stateVersionID)
 	if !found {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
-	summary := summarizeState(sv)
 	var raw interface{}
 	if err := json.Unmarshal(sv.RawState, &raw); err != nil {
 		raw = map[string]interface{}{}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"data": map[string]interface{}{
 			"id":      sv.ID,
 			"serial":  sv.Serial,
 			"created": sv.CreatedAt,
-			"summary": summary,
+			"summary": summarizeState(sv),
 			"raw":     raw,
 		},
 	})
@@ -78,31 +70,38 @@ func handleCLIRuns(w http.ResponseWriter, r *http.Request) {
 	workspaceID := mux.Vars(r)["workspace_id"]
 	if r.Method == http.MethodGet {
 		var runs []CLIRun
-		db.Where("workspace_id = ?", workspaceID).Order("created_at desc").Find(&runs)
+		if err := db.Where("workspace_id = ?", workspaceID).Order("created_at desc").Find(&runs).Error; err != nil {
+			writeInternalError(w)
+			return
+		}
 		data := make([]map[string]interface{}, 0, len(runs))
 		for _, run := range runs {
 			data = append(data, cliRunResponse(run, false))
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"data": data})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"data": data})
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxLogBodyBytes)
 	var payload cliRunPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeBadRequest(w, "invalid request body")
 		return
 	}
 
 	status := normalizeRunStatus(payload.Status)
-	if status == "" || payload.Command == "" {
-		w.WriteHeader(http.StatusBadRequest)
+	if status == "" {
+		writeBadRequest(w, "status must be one of: planned, applied, error")
+		return
+	}
+	if payload.Command == "" {
+		writeBadRequest(w, "command is required")
 		return
 	}
 
 	now := time.Now()
 	run := CLIRun{
-		ID:             "run-" + strconv.FormatInt(now.UnixNano(), 10),
+		ID:             newID("run"),
 		WorkspaceID:    workspaceID,
 		Command:        payload.Command,
 		Status:         status,
@@ -115,60 +114,61 @@ func handleCLIRuns(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := db.Create(&run).Error; err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		writeInternalError(w)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": cliRunResponse(run, true)})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"data": cliRunResponse(run, true)})
 }
 
 func handleGetCLIRun(w http.ResponseWriter, r *http.Request) {
 	runID := mux.Vars(r)["run_id"]
 	var run CLIRun
 	if err := db.Where("id = ?", runID).First(&run).Error; err != nil {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": cliRunResponse(run, true)})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": cliRunResponse(run, true)})
 }
 
 func handleDownloadState(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["sv_id"]
 	var sv StateVersion
 	if err := db.Where("id = ?", id).First(&sv).Error; err != nil {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
 	if !sv.UploadComplete {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(sv.RawState)
+	_, _ = w.Write(sv.RawState)
 }
 
 func handleUploadState(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["sv_id"]
 	var sv StateVersion
 	if err := db.Where("id = ?", id).First(&sv).Error; err != nil {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxStateBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeBadRequest(w, "failed to read request body")
 		return
 	}
 
 	sv.RawState = raw
 	sv.UploadComplete = true
-	db.Save(&sv)
+	if err := db.Save(&sv).Error; err != nil {
+		writeInternalError(w)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -176,10 +176,10 @@ func handleUploadStateJSON(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["sv_id"]
 	var sv StateVersion
 	if err := db.Where("id = ?", id).First(&sv).Error; err != nil {
-		w.WriteHeader(http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
-
 	_, _ = io.Copy(io.Discard, r.Body)
 	w.WriteHeader(http.StatusOK)
 }
+

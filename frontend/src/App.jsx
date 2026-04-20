@@ -1,14 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useReducer } from 'react';
 import { diffLines } from 'diff';
 import './App.css';
 import * as api from './api';
+import { computeNodeLayout } from './utils/resourceLayout';
+import { formatRunLog } from './utils/logFormatter';
+import { useWorkspaceData, useHistoryDetail, useStateDiff, useRunDetail } from './hooks/useWorkspaceData';
 
-const NODE_WIDTH = 260;
-const NODE_HEIGHT = 108;
-const X_GAP = 110;
-const Y_GAP = 38;
-const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g;
-const BRACKET_COLOR_CODE_PATTERN = /\[(?:\d{1,3}(?:;\d{1,3})*)m/g;
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
 
 function displayName(obj) {
   return obj?.Name || obj?.name || obj?.ID || obj?.id || 'unnamed';
@@ -18,256 +18,204 @@ function resourceKey(resource) {
   return resource?.id || resource?.address || `${resource?.type || 'resource'}.${resource?.name || 'unknown'}`;
 }
 
-function normalizeLogLine(line) {
-  return line
-    .replace(ANSI_ESCAPE_PATTERN, '')
-    .replace(BRACKET_COLOR_CODE_PATTERN, '')
-    .replace(/\r/g, '');
-}
+// ---------------------------------------------------------------------------
+// Reducer
+// ---------------------------------------------------------------------------
 
-function classifyLogLine(line) {
-  const trimmed = line.trim();
-  if (trimmed === '') return 'blank';
-  if (/^error:|\berror\b|^\u2577|^\u2575/i.test(trimmed)) return 'error';
-  if (/^warning:|\bwarning\b/i.test(trimmed)) return 'warning';
-  if (/^apply complete!|^plan:\s+\d+ to add, \d+ to change, \d+ to destroy\.?$/i.test(trimmed)) return 'summary';
-  if (/\b(will be created|creation complete|created)\b/i.test(trimmed) || /^\+/.test(trimmed)) return 'added';
-  if (/\b(will be updated|updated in-place|modifying)\b/i.test(trimmed) || /^~/.test(trimmed)) return 'changed';
-  if (/\b(will be destroyed|destroy complete|destroyed)\b/i.test(trimmed) || /^-/.test(trimmed)) return 'removed';
-  if (/^terraform will perform the following actions:$/i.test(trimmed) || /^terraform used the selected providers/i.test(trimmed)) return 'heading';
-  return 'context';
-}
+const initialState = {
+  organizations: [],
+  selectedOrg: null,
+  workspaces: [],
+  selectedWorkspace: null,
+  activeTab: 'history',
+  stateHistory: [],
+  resources: [],
+  runs: [],
+  stateSummary: null,
+  selectedHistoryId: '',
+  selectedHistoryDetail: null,
+  selectedRunId: '',
+  selectedRunDetail: null,
+  diffFromId: '',
+  diffToId: '',
+  stateDiff: null,
+  resourceFilter: '',
+  selectedResourceKey: '',
+  loading: true,
+};
 
-function formatRunLog(rawLog) {
-  const text = rawLog || '';
-  const lines = text.split('\n');
-  return lines.map((line, index) => {
-    const clean = normalizeLogLine(line);
-    return {
-      key: `log-${index}-${clean}`,
-      text: clean,
-      tone: classifyLogLine(clean),
-    };
-  });
-}
-
-function computeNodeLayout(resources) {
-  if (!resources || resources.length === 0) {
-    return { nodes: [], edges: [], width: 900, height: 420 };
+function appReducer(state, action) {
+  switch (action.type) {
+    case 'SET_LOADING':
+      return { ...state, loading: action.value };
+    case 'SET_ORGANIZATIONS':
+      return { ...state, organizations: action.orgs };
+    case 'SELECT_ORG':
+      return {
+        ...state,
+        selectedOrg: action.org,
+        selectedWorkspace: null,
+        workspaces: [],
+        stateHistory: [],
+        resources: [],
+        runs: [],
+        stateSummary: null,
+        selectedHistoryId: '',
+        selectedHistoryDetail: null,
+        selectedRunId: '',
+        selectedRunDetail: null,
+        stateDiff: null,
+        resourceFilter: '',
+        selectedResourceKey: '',
+      };
+    case 'SET_WORKSPACES':
+      return { ...state, workspaces: action.workspaces };
+    case 'SELECT_WORKSPACE':
+      return {
+        ...state,
+        selectedWorkspace: action.workspace,
+        activeTab: 'history',
+        resourceFilter: '',
+        selectedResourceKey: '',
+        selectedHistoryId: '',
+        selectedHistoryDetail: null,
+        selectedRunId: '',
+        selectedRunDetail: null,
+      };
+    case 'CLEAR_WORKSPACE':
+      return { ...state, selectedWorkspace: null };
+    case 'SET_WORKSPACE_DATA': {
+      const history = action.history;
+      const runs = action.runs;
+      return {
+        ...state,
+        stateHistory: history,
+        resources: action.resources,
+        runs,
+        stateSummary: action.stateSummary,
+        selectedHistoryId: history[0]?.ID || '',
+        selectedRunId: runs[0]?.id || '',
+        diffFromId: history.length >= 2 ? history[1].ID : (history[0]?.ID || ''),
+        diffToId: history[0]?.ID || '',
+      };
+    }
+    case 'SET_ACTIVE_TAB':
+      return { ...state, activeTab: action.tab };
+    case 'SELECT_HISTORY_ID':
+      return { ...state, selectedHistoryId: action.id, selectedHistoryDetail: null };
+    case 'SET_HISTORY_DETAIL':
+      return { ...state, selectedHistoryDetail: action.detail };
+    case 'SELECT_RUN_ID':
+      return { ...state, selectedRunId: action.id, selectedRunDetail: null };
+    case 'SET_RUN_DETAIL':
+      return { ...state, selectedRunDetail: action.detail };
+    case 'SET_DIFF_FROM':
+      return { ...state, diffFromId: action.id, stateDiff: null };
+    case 'SET_DIFF_TO':
+      return { ...state, diffToId: action.id, stateDiff: null };
+    case 'SET_STATE_DIFF':
+      return { ...state, stateDiff: action.diff };
+    case 'SET_RESOURCE_FILTER':
+      return { ...state, resourceFilter: action.filter };
+    case 'SELECT_RESOURCE_KEY':
+      return { ...state, selectedResourceKey: action.key };
+    default:
+      return state;
   }
-
-  const byKey = new Map(resources.map((resource) => [resourceKey(resource), resource]));
-  const addressToKeys = new Map();
-
-  resources.forEach((resource) => {
-    const key = resourceKey(resource);
-    const address = resource.address || key;
-    if (!addressToKeys.has(address)) {
-      addressToKeys.set(address, []);
-    }
-    addressToKeys.get(address).push(key);
-  });
-
-  const levelMemo = new Map();
-
-  const resolveLevel = (nodeKey, stack = new Set()) => {
-    if (levelMemo.has(nodeKey)) return levelMemo.get(nodeKey);
-    if (stack.has(nodeKey)) return 0;
-
-    stack.add(nodeKey);
-    const node = byKey.get(nodeKey);
-    const depKeys = (node?.depends_on || [])
-      .flatMap((depAddress) => addressToKeys.get(depAddress) || [])
-      .filter((depKey) => depKey !== nodeKey);
-
-    if (depKeys.length === 0) {
-      levelMemo.set(nodeKey, 0);
-      stack.delete(nodeKey);
-      return 0;
-    }
-
-    const level = Math.max(...depKeys.map((depKey) => resolveLevel(depKey, stack))) + 1;
-    levelMemo.set(nodeKey, level);
-    stack.delete(nodeKey);
-    return level;
-  };
-
-  const grouped = new Map();
-  resources.forEach((resource) => {
-    const nodeKey = resourceKey(resource);
-    const level = resolveLevel(nodeKey);
-    if (!grouped.has(level)) grouped.set(level, []);
-    grouped.get(level).push(resource);
-  });
-
-  const levels = [...grouped.keys()].sort((a, b) => a - b);
-  const layoutNodes = [];
-  let maxPerColumn = 0;
-
-  levels.forEach((level) => {
-    const column = grouped.get(level) || [];
-    column.sort((a, b) => {
-      const left = `${a.module_path || 'root'}|${a.address || ''}|${a.id || ''}`;
-      const right = `${b.module_path || 'root'}|${b.address || ''}|${b.id || ''}`;
-      return left.localeCompare(right);
-    });
-    maxPerColumn = Math.max(maxPerColumn, column.length);
-    column.forEach((resource, row) => {
-      layoutNodes.push({
-        ...resource,
-        key: resourceKey(resource),
-        x: 32 + level * (NODE_WIDTH + X_GAP),
-        y: 32 + row * (NODE_HEIGHT + Y_GAP),
-      });
-    });
-  });
-
-  const positioned = new Map(layoutNodes.map((node) => [node.key, node]));
-  const edges = [];
-  layoutNodes.forEach((node) => {
-    (node.depends_on || []).forEach((depAddress) => {
-      const sourceKeys = addressToKeys.get(depAddress) || [];
-      sourceKeys.forEach((sourceKey) => {
-        const source = positioned.get(sourceKey);
-        if (!source) return;
-        edges.push({
-          from: sourceKey,
-          to: node.key,
-          x1: source.x + NODE_WIDTH,
-          y1: source.y + NODE_HEIGHT / 2,
-          x2: node.x,
-          y2: node.y + NODE_HEIGHT / 2,
-        });
-      });
-    });
-  });
-
-  return {
-    nodes: layoutNodes,
-    edges,
-    width: Math.max(900, levels.length * (NODE_WIDTH + X_GAP) + 160),
-    height: Math.max(420, maxPerColumn * (NODE_HEIGHT + Y_GAP) + 100),
-  };
 }
+
+// ---------------------------------------------------------------------------
+// App component
+// ---------------------------------------------------------------------------
 
 function App() {
-  const [organizations, setOrganizations] = useState([]);
-  const [selectedOrg, setSelectedOrg] = useState(null);
-  const [workspaces, setWorkspaces] = useState([]);
-  const [selectedWorkspace, setSelectedWorkspace] = useState(null);
-  const [activeTab, setActiveTab] = useState('history');
+  const [state, dispatch] = useReducer(appReducer, initialState);
 
-  const [stateHistory, setStateHistory] = useState([]);
-  const [resources, setResources] = useState([]);
-  const [runs, setRuns] = useState([]);
-  const [stateSummary, setStateSummary] = useState(null);
-  const [selectedHistoryId, setSelectedHistoryId] = useState('');
-  const [selectedHistoryDetail, setSelectedHistoryDetail] = useState(null);
-  const [selectedRunId, setSelectedRunId] = useState('');
-  const [selectedRunDetail, setSelectedRunDetail] = useState(null);
-  const [diffFromId, setDiffFromId] = useState('');
-  const [diffToId, setDiffToId] = useState('');
-  const [stateDiff, setStateDiff] = useState(null);
-  const [resourceFilter, setResourceFilter] = useState('');
-  const [selectedResourceKey, setSelectedResourceKey] = useState('');
+  const {
+    organizations,
+    selectedOrg,
+    workspaces,
+    selectedWorkspace,
+    activeTab,
+    stateHistory,
+    resources,
+    runs,
+    stateSummary,
+    selectedHistoryId,
+    selectedHistoryDetail,
+    selectedRunId,
+    selectedRunDetail,
+    diffFromId,
+    diffToId,
+    stateDiff,
+    resourceFilter,
+    selectedResourceKey,
+    loading,
+  } = state;
 
-  const [loading, setLoading] = useState(true);
+  // ---------------------------------------------------------------------------
+  // Data loading hooks
+  // ---------------------------------------------------------------------------
+
+  useWorkspaceData(
+    selectedWorkspace,
+    ({ history, resources: res, runs: r, stateSummary: s }) => {
+      dispatch({ type: 'SET_WORKSPACE_DATA', history, resources: res, runs: r, stateSummary: s });
+    },
+    (err) => console.error('Failed to load workspace details', err),
+  );
+
+  useHistoryDetail(selectedWorkspace, selectedHistoryId, (detail) => {
+    dispatch({ type: 'SET_HISTORY_DETAIL', detail });
+  });
+
+  useStateDiff(selectedWorkspace, diffFromId, diffToId, (diff) => {
+    dispatch({ type: 'SET_STATE_DIFF', diff });
+  });
+
+  useRunDetail(selectedRunId, (detail) => {
+    dispatch({ type: 'SET_RUN_DETAIL', detail });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Org / workspace actions
+  // ---------------------------------------------------------------------------
 
   useEffect(() => {
     loadOrganizations();
   }, []);
 
-  useEffect(() => {
-    if (stateHistory.length >= 2) {
-      setDiffToId(stateHistory[0].ID);
-      setDiffFromId(stateHistory[1].ID);
-    } else if (stateHistory.length === 1) {
-      setDiffToId(stateHistory[0].ID);
-      setDiffFromId(stateHistory[0].ID);
-    }
-  }, [stateHistory]);
-
-  useEffect(() => {
-    const loadDiff = async () => {
-      if (!selectedWorkspace || !diffFromId || !diffToId) {
-        setStateDiff(null);
-        return;
-      }
-      const data = await api.fetchStateDiff(selectedWorkspace.ID, diffFromId, diffToId);
-      setStateDiff(data);
-    };
-    loadDiff();
-  }, [selectedWorkspace, diffFromId, diffToId]);
-
-  useEffect(() => {
-    const loadHistoryDetail = async () => {
-      if (!selectedWorkspace || !selectedHistoryId) {
-        setSelectedHistoryDetail(null);
-        return;
-      }
-      const detail = await api.fetchStateVersionSummary(selectedWorkspace.ID, selectedHistoryId);
-      setSelectedHistoryDetail(detail);
-    };
-    loadHistoryDetail();
-  }, [selectedWorkspace, selectedHistoryId]);
-
-  useEffect(() => {
-    const loadRunDetail = async () => {
-      if (!selectedRunId) {
-        setSelectedRunDetail(null);
-        return;
-      }
-      const detail = await api.fetchRunDetail(selectedRunId);
-      setSelectedRunDetail(detail);
-    };
-    loadRunDetail();
-  }, [selectedRunId]);
-
   const loadOrganizations = async () => {
     try {
-      setLoading(true);
+      dispatch({ type: 'SET_LOADING', value: true });
       const orgs = await api.fetchOrgs();
-      setOrganizations(orgs);
+      dispatch({ type: 'SET_ORGANIZATIONS', orgs });
       if (orgs.length > 0) {
         await handleSelectOrg(orgs[0]);
       }
     } catch (err) {
       console.error('Failed to load organizations', err);
     } finally {
-      setLoading(false);
+      dispatch({ type: 'SET_LOADING', value: false });
     }
   };
 
   const handleCreateOrg = async () => {
     const name = prompt('Organization name');
     if (!name) return;
-
     try {
       await api.createOrg(name);
       await loadOrganizations();
-    } catch (err) {
+    } catch {
       alert('Failed to create organization');
     }
   };
 
   const handleSelectOrg = async (org) => {
-    setSelectedOrg(org);
-    setSelectedWorkspace(null);
-    setStateHistory([]);
-    setResources([]);
-    setRuns([]);
-    setStateSummary(null);
-    setSelectedHistoryId('');
-    setSelectedHistoryDetail(null);
-    setSelectedRunId('');
-    setSelectedRunDetail(null);
-    setStateDiff(null);
-    setResourceFilter('');
-    setSelectedResourceKey('');
-
+    dispatch({ type: 'SELECT_ORG', org });
     try {
       const ws = await api.fetchWorkspaces(org.ID);
-      setWorkspaces(ws);
+      dispatch({ type: 'SET_WORKSPACES', workspaces: ws });
     } catch (err) {
       console.error('Failed to load workspaces', err);
     }
@@ -277,43 +225,22 @@ function App() {
     if (!selectedOrg) return;
     const workspaceName = prompt('Workspace name');
     if (!workspaceName) return;
-
     try {
       await api.createWorkspace(selectedOrg.ID, workspaceName);
       const ws = await api.fetchWorkspaces(selectedOrg.ID);
-      setWorkspaces(ws);
-    } catch (err) {
+      dispatch({ type: 'SET_WORKSPACES', workspaces: ws });
+    } catch {
       alert('Failed to create workspace');
     }
   };
 
-  const handleSelectWorkspace = async (workspace) => {
-    setSelectedWorkspace(workspace);
-    setActiveTab('history');
-    setResourceFilter('');
-    setSelectedResourceKey('');
-    setSelectedHistoryId('');
-    setSelectedHistoryDetail(null);
-    setSelectedRunId('');
-    setSelectedRunDetail(null);
-
-    try {
-      const [history, graphResources, summary, workspaceRuns] = await Promise.all([
-        api.fetchStateVersions(workspace.ID),
-        api.fetchResources(workspace.ID),
-        api.fetchStateSummary(workspace.ID),
-        api.fetchRuns(workspace.ID),
-      ]);
-      setStateHistory(history);
-      setResources(graphResources);
-      setRuns(workspaceRuns);
-      setStateSummary(summary);
-      setSelectedHistoryId(history[0]?.ID || '');
-      setSelectedRunId(workspaceRuns[0]?.id || '');
-    } catch (err) {
-      console.error('Failed to load workspace details', err);
-    }
+  const handleSelectWorkspace = (workspace) => {
+    dispatch({ type: 'SELECT_WORKSPACE', workspace });
   };
+
+  // ---------------------------------------------------------------------------
+  // Memoised derived values
+  // ---------------------------------------------------------------------------
 
   const filteredResources = useMemo(() => {
     const query = resourceFilter.trim().toLowerCase();
@@ -337,19 +264,14 @@ function App() {
 
   const selectedResource = useMemo(() => {
     if (!selectedResourceKey) return null;
-    return resources.find((resource) => resourceKey(resource) === selectedResourceKey) || null;
+    return resources.find((r) => resourceKey(r) === selectedResourceKey) || null;
   }, [resources, selectedResourceKey]);
-
-  const diffRawPreview = useMemo(() => {
-    if (!stateDiff?.raw) return '';
-    return JSON.stringify(stateDiff.raw, null, 2);
-  }, [stateDiff]);
 
   const selectedSummary = selectedHistoryDetail?.summary || stateSummary;
 
   const selectedRun = useMemo(() => {
     if (!selectedRunId) return null;
-    return runs.find((run) => run.id === selectedRunId) || selectedRunDetail;
+    return runs.find((r) => r.id === selectedRunId) || selectedRunDetail;
   }, [runs, selectedRunId, selectedRunDetail]);
 
   const selectedRunLogBody = useMemo(() => {
@@ -364,12 +286,15 @@ function App() {
     return JSON.stringify(selectedHistoryDetail.raw, null, 2);
   }, [selectedHistoryDetail]);
 
+  const diffRawPreview = useMemo(() => {
+    if (!stateDiff?.raw) return '';
+    return JSON.stringify(stateDiff.raw, null, 2);
+  }, [stateDiff]);
+
   const gitLikeDiffBlocks = useMemo(() => {
     if (!stateDiff?.raw) return [];
-
     const before = JSON.stringify(stateDiff.raw.before || {}, null, 2);
     const after = JSON.stringify(stateDiff.raw.after || {}, null, 2);
-
     return diffLines(before, after).flatMap((part) => {
       const lines = part.value.split('\n');
       if (lines[lines.length - 1] === '') lines.pop();
@@ -380,6 +305,10 @@ function App() {
       }));
     });
   }, [stateDiff]);
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
 
   return (
     <div className="app-container">
@@ -470,15 +399,15 @@ function App() {
           ) : (
             <div className="workspace-detail animate-fade-in">
               <div className="detail-header">
-                <button className="back-btn" onClick={() => setSelectedWorkspace(null)}>Back to Workspaces</button>
+                <button className="back-btn" onClick={() => dispatch({ type: 'CLEAR_WORKSPACE' })}>Back to Workspaces</button>
                 <h2>{displayName(selectedWorkspace)}</h2>
               </div>
 
               <div className="tab-nav glass-panel">
-                <button className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`} onClick={() => setActiveTab('history')}>State History</button>
-                <button className={`tab-btn ${activeTab === 'diff' ? 'active' : ''}`} onClick={() => setActiveTab('diff')}>State Diff</button>
-                <button className={`tab-btn ${activeTab === 'runs' ? 'active' : ''}`} onClick={() => setActiveTab('runs')}>Runs</button>
-                <button className={`tab-btn ${activeTab === 'resources' ? 'active' : ''}`} onClick={() => setActiveTab('resources')}>Resource Canvas</button>
+                <button className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`} onClick={() => dispatch({ type: 'SET_ACTIVE_TAB', tab: 'history' })}>State History</button>
+                <button className={`tab-btn ${activeTab === 'diff' ? 'active' : ''}`} onClick={() => dispatch({ type: 'SET_ACTIVE_TAB', tab: 'diff' })}>State Diff</button>
+                <button className={`tab-btn ${activeTab === 'runs' ? 'active' : ''}`} onClick={() => dispatch({ type: 'SET_ACTIVE_TAB', tab: 'runs' })}>Runs</button>
+                <button className={`tab-btn ${activeTab === 'resources' ? 'active' : ''}`} onClick={() => dispatch({ type: 'SET_ACTIVE_TAB', tab: 'resources' })}>Resource Canvas</button>
               </div>
 
               {activeTab === 'history' && (
@@ -545,7 +474,7 @@ function App() {
                         <button
                           key={sv.ID}
                           className={`timeline-item ${selectedHistoryId === sv.ID ? 'active' : ''}`}
-                          onClick={() => setSelectedHistoryId(sv.ID)}
+                          onClick={() => dispatch({ type: 'SELECT_HISTORY_ID', id: sv.ID })}
                         >
                           <div className="timeline-marker"></div>
                           <div className="timeline-content">
@@ -575,7 +504,7 @@ function App() {
                   <div className="diff-controls">
                     <label>
                       From
-                      <select value={diffFromId} onChange={(e) => setDiffFromId(e.target.value)}>
+                      <select value={diffFromId} onChange={(e) => dispatch({ type: 'SET_DIFF_FROM', id: e.target.value })}>
                         <option value="">Select version</option>
                         {stateHistory.map((sv) => (
                           <option key={`from-${sv.ID}`} value={sv.ID}>v{sv.Serial} ({new Date(sv.CreatedAt).toLocaleTimeString()})</option>
@@ -584,7 +513,7 @@ function App() {
                     </label>
                     <label>
                       To
-                      <select value={diffToId} onChange={(e) => setDiffToId(e.target.value)}>
+                      <select value={diffToId} onChange={(e) => dispatch({ type: 'SET_DIFF_TO', id: e.target.value })}>
                         <option value="">Select version</option>
                         {stateHistory.map((sv) => (
                           <option key={`to-${sv.ID}`} value={sv.ID}>v{sv.Serial} ({new Date(sv.CreatedAt).toLocaleTimeString()})</option>
@@ -649,7 +578,7 @@ function App() {
                           <button
                             key={run.id}
                             className={`timeline-item ${selectedRunId === run.id ? 'active' : ''}`}
-                            onClick={() => setSelectedRunId(run.id)}
+                            onClick={() => dispatch({ type: 'SELECT_RUN_ID', id: run.id })}
                           >
                             <div className="timeline-marker"></div>
                             <div className="timeline-content">
@@ -702,7 +631,7 @@ function App() {
                   <div className="resource-toolbar">
                     <input
                       value={resourceFilter}
-                      onChange={(e) => setResourceFilter(e.target.value)}
+                      onChange={(e) => dispatch({ type: 'SET_RESOURCE_FILTER', filter: e.target.value })}
                       placeholder="Filter by address, type, module, provider"
                     />
                     <span>{filteredResources.length} nodes</span>
@@ -733,7 +662,7 @@ function App() {
                             key={node.key}
                             className={`resource-node ${selectedResourceKey === node.key ? 'active' : ''}`}
                             style={{ left: `${node.x}px`, top: `${node.y}px` }}
-                            onClick={() => setSelectedResourceKey(node.key)}
+                            onClick={() => dispatch({ type: 'SELECT_RESOURCE_KEY', key: node.key })}
                           >
                             <div className="resource-node-type">{node.module_path && node.module_path !== 'root' ? 'MODULE RESOURCE' : 'RESOURCE'}</div>
                             <div className="resource-node-name">{node.name}</div>
