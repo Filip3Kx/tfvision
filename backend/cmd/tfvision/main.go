@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -11,10 +12,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
+	"time"
 )
+
+// httpClient is the shared HTTP client used for all API requests.
+// A 30-second timeout guards against hung connections and ensures the CLI
+// does not block indefinitely when the server is unreachable.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
 
 type providerVersion struct {
 	Source  string `json:"source"`
@@ -44,9 +53,14 @@ type runResponse struct {
 	} `json:"data"`
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: tfvision <sync-state|pull-tf-logs> [flags]")
+		printUsage()
+		os.Exit(1)
 	}
 
 	switch os.Args[1] {
@@ -59,9 +73,13 @@ func main() {
 			fatalf("pull-tf-logs failed: %v", err)
 		}
 	default:
-		fatalf("unknown command: %s", os.Args[1])
+		fatalf("unknown command %q\n\nRun tfvision with no arguments for usage.", os.Args[1])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
 
 func runSyncState(args []string) error {
 	fs := flag.NewFlagSet("sync-state", flag.ContinueOnError)
@@ -70,16 +88,20 @@ func runSyncState(args []string) error {
 	host := fs.String("host", envOr("TFVISION_HOST", "http://localhost:8080"), "TFVision base URL")
 	organization := fs.String("organization", envOr("TFVISION_ORGANIZATION", ""), "organization name")
 	workspace := fs.String("workspace", envOr("TFVISION_WORKSPACE", ""), "workspace name")
-	stateFile := fs.String("state-file", envOr("TFVISION_STATE_FILE", ""), "optional path to state file; if omitted, enriches the latest DB-backed state with provider versions")
+	stateFile := fs.String("state-file", envOr("TFVISION_STATE_FILE", ""), "path to .tfstate file; omit to enrich the latest state with provider versions only")
 	lockFile := fs.String("lock-file", envOr("TFVISION_LOCK_FILE", ".terraform.lock.hcl"), "path to .terraform.lock.hcl")
-	serial := fs.Int("serial", 0, "override state serial")
-	lineage := fs.String("lineage", "", "override state lineage")
+	serial := fs.Int("serial", 0, "override state serial (optional)")
+	lineage := fs.String("lineage", "", "override state lineage (optional)")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("%w\n\nUsage: tfvision sync-state --organization ORG --workspace WS [--lock-file .terraform.lock.hcl] [--state-file terraform.tfstate]", err)
 	}
-	if *organization == "" || *workspace == "" {
-		return errors.New("--organization and --workspace are required")
+
+	if *organization == "" {
+		return errors.New("--organization is required")
+	}
+	if *workspace == "" {
+		return errors.New("--workspace is required")
 	}
 
 	providers, err := parseLockFile(*lockFile)
@@ -114,7 +136,8 @@ func runSyncState(args []string) error {
 		return err
 	}
 
-	fmt.Printf("synced state version %s for workspace %s (serial=%d, providers=%d)\n", resp.Data.ID, resp.Data.WorkspaceID, resp.Data.Serial, resp.Data.ProviderCount)
+	fmt.Printf("synced state version %s for workspace %s (serial=%d, providers=%d)\n",
+		resp.Data.ID, resp.Data.WorkspaceID, resp.Data.Serial, resp.Data.ProviderCount)
 	return nil
 }
 
@@ -125,18 +148,34 @@ func runPullTFLogs(args []string) error {
 	host := fs.String("host", envOr("TFVISION_HOST", "http://localhost:8080"), "TFVision base URL")
 	organization := fs.String("organization", envOr("TFVISION_ORGANIZATION", ""), "organization name")
 	workspace := fs.String("workspace", envOr("TFVISION_WORKSPACE", ""), "workspace name")
-	command := fs.String("command", "", "terraform command name (init/plan/apply)")
+	command := fs.String("command", "", "terraform command (e.g. init, plan, apply)")
 	status := fs.String("status", "", "run status: planned|applied|error")
-	message := fs.String("message", "", "message shown in UI")
-	logFile := fs.String("log-file", "", "path to captured terraform logs")
-	readStdin := fs.Bool("stdin", false, "read log body from stdin")
+	message := fs.String("message", "", "human-readable message shown in the UI")
+	logFile := fs.String("log-file", "", "path to captured terraform log output")
+	readStdin := fs.Bool("stdin", false, "read log body from stdin (mutually exclusive with --log-file)")
 	stateVersionID := fs.String("state-version-id", "", "optional related state version id")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("%w\n\nUsage: tfvision pull-tf-logs --organization ORG --workspace WS --command plan --status planned [--log-file plan.log|--stdin]", err)
 	}
-	if *organization == "" || *workspace == "" || *command == "" || *status == "" {
-		return errors.New("--organization, --workspace, --command, and --status are required")
+
+	if *organization == "" {
+		return errors.New("--organization is required")
+	}
+	if *workspace == "" {
+		return errors.New("--workspace is required")
+	}
+	if *command == "" {
+		return errors.New("--command is required")
+	}
+	if *status == "" {
+		return errors.New("--status is required (planned|applied|error)")
+	}
+	if !isValidRunStatus(*status) {
+		return fmt.Errorf("--status %q is not valid; must be one of: planned, applied, error", *status)
+	}
+	if *logFile != "" && *readStdin {
+		return errors.New("--log-file and --stdin are mutually exclusive")
 	}
 
 	logBody, err := loadLogBody(*logFile, *readStdin)
@@ -166,6 +205,18 @@ func runPullTFLogs(args []string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func isValidRunStatus(s string) bool {
+	switch strings.TrimSpace(strings.ToLower(s)) {
+	case "planned", "applied", "error":
+		return true
+	}
+	return false
+}
+
 func loadLogBody(logFile string, readStdin bool) (string, error) {
 	if logFile != "" {
 		content, err := os.ReadFile(logFile)
@@ -184,29 +235,81 @@ func loadLogBody(logFile string, readStdin bool) (string, error) {
 	return "", nil
 }
 
+// parseLockFile extracts provider source/version pairs from a .terraform.lock.hcl
+// file using a line-by-line parser.  This is more resilient than a single
+// multiline regex and correctly handles nested braces, blank lines, and
+// provider blocks that span many lines.
 func parseLockFile(path string) ([]providerVersion, error) {
-	content, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	providerRe := regexp.MustCompile(`provider\s+"([^"]+)"\s+\{([\s\S]*?)\n\}`)
-	versionRe := regexp.MustCompile(`version\s*=\s*"([^"]+)"`)
-	matches := providerRe.FindAllStringSubmatch(string(content), -1)
-	providers := make([]providerVersion, 0, len(matches))
-	for _, match := range matches {
-		versionMatch := versionRe.FindStringSubmatch(match[2])
-		version := "unknown"
-		if len(versionMatch) > 1 {
-			version = versionMatch[1]
+	defer f.Close()
+
+	var providers []providerVersion
+	var currentSource string
+	var currentVersion string
+	depth := 0
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Detect provider block opening: provider "source" {
+		if depth == 0 && strings.HasPrefix(line, "provider") && strings.Contains(line, `"`) {
+			currentSource = extractQuotedValue(line)
+			currentVersion = ""
+			if strings.HasSuffix(line, "{") {
+				depth = 1
+			}
+			continue
 		}
-		providers = append(providers, providerVersion{Source: match[1], Version: version})
+
+		if depth > 0 {
+			// Track brace depth.
+			depth += strings.Count(line, "{")
+			depth -= strings.Count(line, "}")
+
+			// Extract version assignment inside the block.
+			if currentVersion == "" && strings.HasPrefix(line, "version") && strings.Contains(line, "=") {
+				currentVersion = extractQuotedValue(line)
+			}
+
+			// Block closed.
+			if depth == 0 && currentSource != "" {
+				if currentVersion == "" {
+					currentVersion = "unknown"
+				}
+				providers = append(providers, providerVersion{Source: currentSource, Version: currentVersion})
+				currentSource = ""
+				currentVersion = ""
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan lock file: %w", err)
 	}
 	return providers, nil
 }
 
+// extractQuotedValue returns the first double-quoted string found in line.
+func extractQuotedValue(line string) string {
+	start := strings.Index(line, `"`)
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(line[start+1:], `"`)
+	if end < 0 {
+		return ""
+	}
+	return line[start+1 : start+1+end]
+}
+
 func resolveWorkspaceID(host string, organization string, workspace string) (string, error) {
 	var resp workspaceResponse
-	endpoint := joinURL(host, fmt.Sprintf("/api/v2/organizations/%s/workspaces/%s", url.PathEscape(organization), url.PathEscape(workspace)))
+	endpoint := joinURL(host, fmt.Sprintf("/api/v2/organizations/%s/workspaces/%s",
+		url.PathEscape(organization), url.PathEscape(workspace)))
 	if err := requestJSON(http.MethodGet, endpoint, nil, &resp); err != nil {
 		return "", fmt.Errorf("resolve workspace: %w", err)
 	}
@@ -221,33 +324,36 @@ func requestJSON(method string, endpoint string, payload interface{}, out interf
 	if payload != nil {
 		raw, err := json.Marshal(payload)
 		if err != nil {
-			return err
+			return fmt.Errorf("marshal request: %w", err)
 		}
 		body = bytes.NewReader(raw)
 	}
 
 	req, err := http.NewRequest(method, endpoint, body)
 	if err != nil {
-		return err
+		return fmt.Errorf("build request: %w", err)
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("request %s %s: %w", method, endpoint, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("request failed: %s %s", resp.Status, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("request failed with %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
 	if out == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
 }
 
 func joinURL(base string, path string) string {
@@ -255,11 +361,10 @@ func joinURL(base string, path string) string {
 }
 
 func envOr(key string, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
 	}
-	return value
+	return fallback
 }
 
 func fatalf(format string, args ...interface{}) {
@@ -267,11 +372,15 @@ func fatalf(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func init() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "tfvision commands:\n")
-		fmt.Fprintf(os.Stderr, "  tfvision sync-state --organization ORG --workspace WS [--lock-file .terraform.lock.hcl] [--state-file terraform.tfstate]\n")
-		fmt.Fprintf(os.Stderr, "  tfvision pull-tf-logs --organization ORG --workspace WS --command plan --status planned [--message TEXT] [--log-file plan.log|--stdin]\n")
-	}
-	_ = filepath.Separator
+func printUsage() {
+	fmt.Fprintln(os.Stderr, "Usage: tfvision <command> [flags]")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Commands:")
+	fmt.Fprintln(os.Stderr, "  sync-state     Sync a Terraform state file and provider versions to TFVision.")
+	fmt.Fprintln(os.Stderr, "  pull-tf-logs   Store Terraform run logs in TFVision.")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Examples:")
+	fmt.Fprintln(os.Stderr, "  tfvision sync-state --organization acme --workspace prod --state-file terraform.tfstate")
+	fmt.Fprintln(os.Stderr, "  tfvision pull-tf-logs --organization acme --workspace prod --command plan --status planned --stdin")
 }
+
