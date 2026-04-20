@@ -94,7 +94,8 @@ func runSyncState(args []string) error {
 	lineage := fs.String("lineage", "", "override state lineage (optional)")
 
 	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("%w\n\nUsage: tfvision sync-state --organization ORG --workspace WS [--lock-file .terraform.lock.hcl] [--state-file terraform.tfstate]", err)
+		fmt.Fprintln(os.Stderr, "Usage: tfvision sync-state --organization ORG --workspace WS [--lock-file .terraform.lock.hcl] [--state-file terraform.tfstate]")
+		return err
 	}
 
 	if *organization == "" {
@@ -156,7 +157,8 @@ func runPullTFLogs(args []string) error {
 	stateVersionID := fs.String("state-version-id", "", "optional related state version id")
 
 	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("%w\n\nUsage: tfvision pull-tf-logs --organization ORG --workspace WS --command plan --status planned [--log-file plan.log|--stdin]", err)
+		fmt.Fprintln(os.Stderr, "Usage: tfvision pull-tf-logs --organization ORG --workspace WS --command plan --status planned [--log-file plan.log|--stdin]")
+		return err
 	}
 
 	if *organization == "" {

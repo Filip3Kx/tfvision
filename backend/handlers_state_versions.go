@@ -46,7 +46,7 @@ func handleCreateStateVersion(w http.ResponseWriter, r *http.Request) {
 
 	var payload stateVersionCreatePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeBadRequest(w, "invalid request body")
+		writeBadRequest(w, fmt.Sprintf("invalid request body: %s", err.Error()))
 		return
 	}
 

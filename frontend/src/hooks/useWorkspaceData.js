@@ -13,7 +13,6 @@ export function useWorkspaceData(selectedWorkspace, onData, onError) {
   useEffect(() => {
     if (!selectedWorkspace) return;
 
-    const controller = new AbortController();
     let cancelled = false;
 
     const load = async () => {
@@ -38,7 +37,6 @@ export function useWorkspaceData(selectedWorkspace, onData, onError) {
 
     return () => {
       cancelled = true;
-      controller.abort();
     };
   }, [selectedWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 }

@@ -3,6 +3,7 @@ module github.com/tfvision/backend
 go 1.25.0
 
 require (
+	github.com/glebarez/sqlite v1.11.0
 	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/terraform-json v0.27.2
 	gorm.io/driver/postgres v1.6.0
@@ -13,7 +14,6 @@ require (
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/glebarez/go-sqlite v1.21.2 // indirect
-	github.com/glebarez/sqlite v1.11.0 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/hashicorp/go-version v1.7.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
