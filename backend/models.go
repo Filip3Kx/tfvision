@@ -10,10 +10,15 @@ type Organization struct {
 	CreatedAt time.Time
 }
 
+// Workspace represents a Terraform workspace inside an organisation.
+// The Name column has a composite unique index scoped to the organisation so
+// two different organisations can independently have a workspace named "prod".
+// NOTE: If you are upgrading from an earlier schema that had a global uniqueIndex
+// on Name, drop the old constraint manually before running the server.
 type Workspace struct {
 	ID             string `gorm:"primary_key"`
-	Name           string `gorm:"uniqueIndex"`
-	OrganizationID string
+	Name           string `gorm:"uniqueIndex:idx_workspace_org_name"`
+	OrganizationID string `gorm:"uniqueIndex:idx_workspace_org_name;index"`
 	CreatedAt      time.Time
 
 	TerraformVersion string
@@ -26,7 +31,7 @@ type Workspace struct {
 
 type StateVersion struct {
 	ID             string `gorm:"primary_key"`
-	WorkspaceID    string
+	WorkspaceID    string `gorm:"index"`
 	Serial         int
 	Lineage        string
 	RawState       []byte // binary .tfstate
@@ -47,10 +52,14 @@ type CLIRun struct {
 	CompletedAt    *time.Time
 }
 
+// ProviderSelection stores the provider version pinned for a given state version.
+// The composite unique index on (state_version_id, source) prevents duplicate
+// provider entries for the same source when sync-state is called more than once.
 type ProviderSelection struct {
 	ID             string `gorm:"primary_key"`
-	StateVersionID string `gorm:"index"`
-	Source         string
+	StateVersionID string `gorm:"uniqueIndex:idx_provider_sv_source;index"`
+	Source         string `gorm:"uniqueIndex:idx_provider_sv_source"`
 	Version        string
 	CreatedAt      time.Time
 }
+
