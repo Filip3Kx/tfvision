@@ -1,0 +1,66 @@
+services:
+  caddy:
+    image: caddy:2.7
+    container_name: tfvision-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TFVISION_DOMAIN: ${TFVISION_DOMAIN:-tfvision.test}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+      - frontend_dist:/var/www/tfvision:ro
+    networks:
+      tfvision:
+        aliases:
+          - ${TFVISION_DOMAIN:-tfvision.test}
+
+  backend:
+    build:
+      context: ./backend
+    container_name: tfvision-backend
+    environment:
+      DATABASE_URL: host=db user=${POSTGRES_USER:-tfvision} password=${POSTGRES_PASSWORD:-tfvision} dbname=${POSTGRES_DB:-tfvision} port=5432 sslmode=disable
+    networks:
+      - tfvision
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: tfvision-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tfvision}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfvision}
+      POSTGRES_DB: ${POSTGRES_DB:-tfvision}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - tfvision
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfvision}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: tfvision-frontend
+    volumes:
+      - frontend_dist:/app/dist
+    networks:
+      - tfvision
+
+networks:
+  tfvision:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+  pg_data:
+  frontend_dist:

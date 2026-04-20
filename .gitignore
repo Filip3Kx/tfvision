@@ -1,0 +1,6 @@
+.env
+caddy_root.crt
+frontend/dist/
+frontend/node_modules/
+backend/tfvision
+backend/main

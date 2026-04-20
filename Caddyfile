@@ -1,0 +1,27 @@
+# Terraform state backend discovery requires HTTPS.
+# Serve both configured domain and localhost as a usability fallback.
+{$TFVISION_DOMAIN:tfvision.test}, localhost {
+    tls internal
+    log
+
+    # API Proxying
+    handle /api/* {
+        reverse_proxy backend:8080
+    }
+
+    handle /.well-known/* {
+        reverse_proxy backend:8080
+    }
+
+    # Internal state/logs
+    handle /internal/* {
+        reverse_proxy backend:8080
+    }
+
+    # Frontend serving
+    handle {
+        root * /var/www/tfvision
+        file_server
+        try_files {path} /index.html
+    }
+}
