@@ -2,6 +2,8 @@
 
 A self-hosted Terraform state platform with a web UI.
 
+<img width="676" height="426" alt="image" src="https://github.com/user-attachments/assets/06ca7b52-b5f0-4828-b1b6-8cff03ddddff" />
+
 tfvision is state-first and local-execution friendly:
 - Terraform still runs on your machine or in CI.
 - State versions are stored in PostgreSQL.
